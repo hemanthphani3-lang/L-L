@@ -1,0 +1,55 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+app/build/
+build/
+.gradle/
+.kotlin/
+
+# Gradle files
+.gradle/
+buildOutputCleanup/
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local configuration file (contains private SDK paths)
+local.properties
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Python / Laptop Companion
+__pycache__/
+*.py[cod]
+*$py.class
+*.pem
+*.key
+.offgrid_companion_key.pem
+tools/laptop-companion/.offgrid_companion_key.pem
+tools/laptop-companion/downloads/*
+!tools/laptop-companion/downloads/.gitkeep
+
+# Editor & Log files
+*.log
+.vscode/

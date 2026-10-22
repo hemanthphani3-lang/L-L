@@ -1,0 +1,13 @@
+# Optional: For native OS mDNS/DNS-SD integration and QR code pairing
+zeroconf>=0.131.0
+qrcode>=8.0
+
+# Windows Screen Sharing & Audio Loopback
+aiortc>=1.15.0
+av>=14.0.0
+pycaw>=20240210
+comtypes>=1.4.0
+sounddevice>=0.5.0
+pywin32>=306
+Pillow>=10.0.0
+numpy>=1.26.0
