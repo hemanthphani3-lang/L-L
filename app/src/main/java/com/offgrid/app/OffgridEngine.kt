@@ -664,17 +664,24 @@ class OffgridEngine(context: Context) {
         val envelope = MessageEnvelope.fromBytes(bytes) ?: return
         val myId = identityManager.identity.value.offgridId
 
+        // Eligible authenticated, connected relay neighbors from connected peers list
+        val eligibleNeighbors = _peers.value
+            .filter { it.connectionStatus == ConnectionState.CONNECTED && it.offgridId != null }
+            .map { it.endpointId }
+
         // Handle through routing engine (checks duplicates, hop limits, relay forwarding)
-        val isForLocalDelivery = routingEngine.shouldProcessOrForward(
+        val routingResult = routingEngine.shouldProcessOrForward(
             envelope = envelope,
             myOffgridId = myId,
+            ingressEndpointId = endpointId,
+            eligibleNeighbors = eligibleNeighbors,
             forwardCallback = { nextHopEndpoint, updatedEnvelope ->
-                val adapter = endpointToTransport[nextHopEndpoint]
-                adapter?.sendPayload(nextHopEndpoint, updatedEnvelope.toBytes())
+                val adapter = getTransportForEndpoint(nextHopEndpoint)
+                adapter.sendPayload(nextHopEndpoint, updatedEnvelope.toBytes())
             }
         )
 
-        if (!isForLocalDelivery) return
+        if (!routingResult.shouldProcessLocally) return
 
         // Dispatch based on payload type
         when (envelope.type) {
@@ -705,7 +712,12 @@ class OffgridEngine(context: Context) {
                 callManager.handleIncomingSignaling(envelope)
             }
             EnvelopeType.ROUTE_ADVERTISEMENT -> {
-                routingEngine.processRouteAdvertisement(envelope.senderId, endpointId, envelope.payload)
+                routingEngine.processRouteAdvertisement(
+                    envelope.senderId,
+                    endpointId,
+                    envelope.payload,
+                    envelope.hopCount
+                )
             }
             EnvelopeType.PING -> {
                 val pong = MessageEnvelope(

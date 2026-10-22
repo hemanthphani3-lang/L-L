@@ -18,17 +18,30 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 
 class AdaptiveRoutingEngine(
-    private val database: AppDatabase,
-    private val scope: CoroutineScope
+    private val database: AppDatabase? = null,
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default),
+    deduplicator: MessageDeduplicator = MessageDeduplicator(capacity = 2000)
 ) {
-    private val deduplicator = MessageDeduplicator(capacity = 2000)
+    val deduplicator: MessageDeduplicator = deduplicator
     private val inMemoryRoutes = ConcurrentHashMap<String, RouteEntry>()
 
     private val _activeRoutes = MutableStateFlow<List<RouteEntry>>(emptyList())
     val activeRoutes: StateFlow<List<RouteEntry>> = _activeRoutes
 
-    var isRelayEnabled: Boolean = true
-    var maxHopsAllowed: Int = 5
+    val routingPolicy: RoutingPolicy = RoutingPolicy(
+        isRelayEnabled = true,
+        maxHopsAllowed = 5,
+        deduplicator = deduplicator
+    )
+
+    var isRelayEnabled: Boolean
+        get() = routingPolicy.isRelayEnabled
+        set(value) { routingPolicy.isRelayEnabled = value }
+
+    var maxHopsAllowed: Int
+        get() = routingPolicy.maxHopsAllowed
+        set(value) { routingPolicy.maxHopsAllowed = value }
+
     var maxQueueSize: Int = 200
 
     fun addDirectNeighbor(peerId: String, endpointId: String, transportType: TransportType) {
@@ -44,18 +57,20 @@ class AdaptiveRoutingEngine(
         inMemoryRoutes[peerId] = entry
         _activeRoutes.value = inMemoryRoutes.values.toList()
 
-        scope.launch(Dispatchers.IO) {
-            database.routeDao().insertOrUpdateRoute(
-                RouteEntity(
-                    destinationId = entry.destinationId,
-                    nextHopEndpointId = entry.nextHopEndpointId,
-                    transportType = entry.transportType.name,
-                    hopCount = entry.hopCount,
-                    linkQuality = entry.linkQuality,
-                    lastSeenTimestamp = entry.lastSeenTimestamp,
-                    expiryTimestamp = entry.expiryTimestamp
+        database?.let { db ->
+            scope.launch(Dispatchers.IO) {
+                db.routeDao().insertOrUpdateRoute(
+                    RouteEntity(
+                        destinationId = entry.destinationId,
+                        nextHopEndpointId = entry.nextHopEndpointId,
+                        transportType = entry.transportType.name,
+                        hopCount = entry.hopCount,
+                        linkQuality = entry.linkQuality,
+                        lastSeenTimestamp = entry.lastSeenTimestamp,
+                        expiryTimestamp = entry.expiryTimestamp
+                    )
                 )
-            )
+            }
         }
     }
 
@@ -78,28 +93,64 @@ class AdaptiveRoutingEngine(
         return null
     }
 
-    fun processRouteAdvertisement(senderPeerId: String, nextHopEndpointId: String, advertisementJson: String) {
+    fun getEligibleRelayEndpoints(excludeEndpointId: String? = null): List<String> {
+        val now = System.currentTimeMillis()
+        return inMemoryRoutes.values
+            .filter { it.hopCount == 1 && it.expiryTimestamp > now }
+            .map { it.nextHopEndpointId }
+            .filter { excludeEndpointId == null || it != excludeEndpointId }
+            .distinct()
+    }
+
+    fun processRouteAdvertisement(
+        senderPeerId: String,
+        nextHopEndpointId: String,
+        advertisementJson: String,
+        hopCount: Int = 0
+    ) {
         try {
             val json = JSONObject(advertisementJson)
-            val routesArray = json.optJSONArray("routes") ?: return
-            for (i in 0 until routesArray.length()) {
-                val r = routesArray.getJSONObject(i)
-                val dest = r.getString("dest")
-                val hops = r.getInt("hops") + 1 // Add 1 hop from relay neighbor
-                if (hops > maxHopsAllowed) continue
+            val origin = json.optString("origin", senderPeerId)
+            val routesArray = json.optJSONArray("routes")
 
-                val existing = inMemoryRoutes[dest]
-                if (existing == null || existing.hopCount > hops || existing.expiryTimestamp < System.currentTimeMillis()) {
-                    val newEntry = RouteEntry(
-                        destinationId = dest,
+            // Ensure origin is recognized as reachable through nextHopEndpointId
+            val originHops = hopCount + 1
+            if (originHops <= maxHopsAllowed && origin.isNotBlank()) {
+                val existingOrigin = inMemoryRoutes[origin]
+                if (existingOrigin == null || existingOrigin.hopCount > originHops || existingOrigin.expiryTimestamp < System.currentTimeMillis()) {
+                    inMemoryRoutes[origin] = RouteEntry(
+                        destinationId = origin,
                         nextHopEndpointId = nextHopEndpointId,
                         transportType = TransportType.RELAY,
-                        hopCount = hops,
-                        linkQuality = 80 - (hops * 10).coerceAtMost(60),
+                        hopCount = originHops,
+                        linkQuality = (80 - (originHops * 10)).coerceIn(20, 100),
                         lastSeenTimestamp = System.currentTimeMillis(),
                         expiryTimestamp = System.currentTimeMillis() + 45_000L
                     )
-                    inMemoryRoutes[dest] = newEntry
+                }
+            }
+
+            if (routesArray != null) {
+                for (i in 0 until routesArray.length()) {
+                    val r = routesArray.getJSONObject(i)
+                    val dest = r.getString("dest")
+                    val baseHops = r.getInt("hops")
+                    val totalHops = baseHops + hopCount + 1
+                    if (totalHops > maxHopsAllowed) continue
+
+                    val existing = inMemoryRoutes[dest]
+                    if (existing == null || existing.hopCount > totalHops || existing.expiryTimestamp < System.currentTimeMillis()) {
+                        val newEntry = RouteEntry(
+                            destinationId = dest,
+                            nextHopEndpointId = nextHopEndpointId,
+                            transportType = TransportType.RELAY,
+                            hopCount = totalHops,
+                            linkQuality = (80 - (totalHops * 10)).coerceIn(20, 100),
+                            lastSeenTimestamp = System.currentTimeMillis(),
+                            expiryTimestamp = System.currentTimeMillis() + 45_000L
+                        )
+                        inMemoryRoutes[dest] = newEntry
+                    }
                 }
             }
             _activeRoutes.value = inMemoryRoutes.values.toList()
@@ -110,7 +161,14 @@ class AdaptiveRoutingEngine(
         val root = JSONObject()
         root.put("origin", myId)
         val array = JSONArray()
-        inMemoryRoutes.values.filter { it.expiryTimestamp > System.currentTimeMillis() }.forEach { r ->
+        // Include self at 0 hops
+        val selfObj = JSONObject().apply {
+            put("dest", myId)
+            put("hops", 0)
+        }
+        array.put(selfObj)
+
+        inMemoryRoutes.values.filter { it.expiryTimestamp > System.currentTimeMillis() && it.destinationId != myId }.forEach { r ->
             val obj = JSONObject().apply {
                 put("dest", r.destinationId)
                 put("hops", r.hopCount)
@@ -122,65 +180,76 @@ class AdaptiveRoutingEngine(
     }
 
     /**
-     * Handles an incoming envelope. Returns:
-     * - `true` if this envelope is intended for local delivery (recipient is this device or broadcast).
-     * - `false` if forwarded or dropped.
+     * Handles an incoming envelope and evaluates routing action.
+     * Returns a [RoutingResult] representing local delivery, forwarding, local delivery + forwarding, or drop.
+     */
+    fun shouldProcessOrForward(
+        envelope: MessageEnvelope,
+        myOffgridId: String,
+        ingressEndpointId: String? = null,
+        eligibleNeighbors: List<String>? = null,
+        forwardCallback: ((nextHopEndpointId: String, updatedEnvelope: MessageEnvelope) -> Unit)? = null
+    ): RoutingResult {
+        val neighbors = eligibleNeighbors ?: getEligibleRelayEndpoints(ingressEndpointId)
+        val result = routingPolicy.evaluate(
+            envelope = envelope,
+            myOffgridId = myOffgridId,
+            ingressEndpointId = ingressEndpointId,
+            eligibleNeighbors = neighbors,
+            findRoute = { findRoute(it) }
+        )
+
+        when (result) {
+            is RoutingResult.LocalDeliveryAndForward -> {
+                result.forwardTargets.forEach { target ->
+                    forwardCallback?.invoke(target.nextHopEndpointId, target.envelope)
+                }
+            }
+            is RoutingResult.Forward -> {
+                forwardCallback?.invoke(result.nextHopEndpointId, result.updatedEnvelope)
+            }
+            is RoutingResult.QueuedForRelay -> {
+                database?.let { db ->
+                    scope.launch(Dispatchers.IO) {
+                        db.relayQueueDao().enqueuePacket(
+                            RelayQueueEntity(
+                                packetId = envelope.envelopeId,
+                                originId = envelope.senderId,
+                                destinationId = envelope.recipientId,
+                                nextHopId = null,
+                                payloadType = envelope.type.name,
+                                payloadBytes = envelope.toBytes(),
+                                createdTimestamp = envelope.timestamp,
+                                expiryTimestamp = envelope.expiry,
+                                hopCount = envelope.hopCount + 1,
+                                maxHops = envelope.maxHops,
+                                status = "QUEUED"
+                            )
+                        )
+                    }
+                }
+            }
+            else -> {}
+        }
+
+        return result
+    }
+
+    /**
+     * Backward-compatible overload.
      */
     fun shouldProcessOrForward(
         envelope: MessageEnvelope,
         myOffgridId: String,
         forwardCallback: (nextHopEndpointId: String, updatedEnvelope: MessageEnvelope) -> Unit
-    ): Boolean {
-        // 1. Check for duplicates
-        if (!deduplicator.recordMessage(envelope.envelopeId)) {
-            return false // Duplicate packet dropped
-        }
-
-        // 2. Check TTL / Expiry
-        if (envelope.expiry < System.currentTimeMillis()) {
-            return false // Expired packet dropped
-        }
-
-        // 3. Intended for this node, direct peer, self, or broadcast
-        if (envelope.recipientId == myOffgridId ||
-            envelope.recipientId == "BROADCAST" ||
-            envelope.recipientId == "PEER" ||
-            envelope.recipientId == "SELF" ||
-            envelope.recipientId.isBlank()
-        ) {
-            return true
-        }
-
-        // 4. Relay logic
-        if (!isRelayEnabled) return false
-        if (envelope.hopCount >= envelope.maxHops) return false // Hop limit reached
-
-        // Find route to destination
-        val route = findRoute(envelope.recipientId)
-        if (route != null) {
-            val updatedEnvelope = envelope.copy(hopCount = envelope.hopCount + 1)
-            forwardCallback(route.nextHopEndpointId, updatedEnvelope)
-        } else {
-            // Queue in store-and-forward queue
-            scope.launch(Dispatchers.IO) {
-                database.relayQueueDao().enqueuePacket(
-                    RelayQueueEntity(
-                        packetId = envelope.envelopeId,
-                        originId = envelope.senderId,
-                        destinationId = envelope.recipientId,
-                        nextHopId = null,
-                        payloadType = envelope.type.name,
-                        payloadBytes = envelope.toBytes(),
-                        createdTimestamp = envelope.timestamp,
-                        expiryTimestamp = envelope.expiry,
-                        hopCount = envelope.hopCount + 1,
-                        maxHops = envelope.maxHops,
-                        status = "QUEUED"
-                    )
-                )
-            }
-        }
-        return false
+    ): RoutingResult {
+        return shouldProcessOrForward(
+            envelope = envelope,
+            myOffgridId = myOffgridId,
+            ingressEndpointId = null,
+            eligibleNeighbors = null,
+            forwardCallback = forwardCallback
+        )
     }
 
     fun purgeExpiredRoutes() {
